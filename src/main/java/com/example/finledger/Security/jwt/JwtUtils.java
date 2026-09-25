@@ -5,8 +5,10 @@ import io.jsonwebtoken.ExpiredJwtException;
 import io.jsonwebtoken.Jwts;
 import io.jsonwebtoken.MalformedJwtException;
 import io.jsonwebtoken.UnsupportedJwtException;
+import io.jsonwebtoken.io.DecodingException;
 import io.jsonwebtoken.io.Decoders;
 import io.jsonwebtoken.security.Keys;
+import jakarta.annotation.PostConstruct;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.extern.slf4j.Slf4j;
@@ -33,6 +35,40 @@ public class JwtUtils {
     @Value("${spring.app.jwtCookieName}")
     private String jwtCookie;
 
+    @Value("${spring.app.jwtCookiePath:/api}")
+    private String jwtCookiePath;
+
+    @Value("${spring.app.jwtCookieHttpOnly:true}")
+    private boolean jwtCookieHttpOnly;
+
+    @Value("${spring.app.jwtCookieSecure:false}")
+    private boolean jwtCookieSecure;
+
+    @Value("${spring.app.jwtCookieSameSite:Lax}")
+    private String jwtCookieSameSite;
+
+    @PostConstruct
+    public void validateConfiguration() {
+        if (jwtSecret == null || jwtSecret.isBlank()) {
+            throw new IllegalStateException("spring.app.jwtSecret must be provided (base64-encoded signing key)");
+        }
+        try {
+            if (Decoders.BASE64.decode(jwtSecret).length < 64) {
+                throw new IllegalStateException(
+                        "spring.app.jwtSecret must decode to at least 64 bytes (512 bits) for HS512. "
+                        + "Generate one with: openssl rand -base64 64");
+            }
+        } catch (DecodingException | IllegalArgumentException e) {
+            throw new IllegalStateException("spring.app.jwtSecret must be valid base64. "
+                    + "Generate one with: openssl rand -base64 64", e);
+        }
+        if (jwtExpirationMs <= 0) {
+            throw new IllegalStateException("spring.app.jwtExpirationMs must be greater than zero");
+        }
+        log.info("JWT configuration valid (cookie path={}, httpOnly={}, secure={}, sameSite={})",
+                jwtCookiePath, jwtCookieHttpOnly, jwtCookieSecure, jwtCookieSameSite);
+    }
+
     //Getting JWT from header
     //Old Method without cookie
     //FOR SWAGGER AS VO COOKIE NHI SAMJHTA
@@ -57,17 +93,26 @@ public class JwtUtils {
     public ResponseCookie generateJwtCookie(UserDetailsImpl userDetails) { //Used in sign in
         String jwt = generateTokenFromUsername(userDetails);
         log.debug("JWT cookie generated for user: {}", userDetails.getUsername());
+        // Cookie lifetime is intentionally aligned to the JWT lifetime so the
+        // browser never holds an expired token (no cookie/JWT mismatch).
+        long maxAgeSeconds = jwtExpirationMs / 1000;
         ResponseCookie cookie = ResponseCookie.from(jwtCookie, jwt)
-                .path("/api")  //Valid within this
-                .maxAge(24*60*60)
-                .httpOnly(false) //Allowing js access
+                .path(jwtCookiePath)
+                .maxAge(maxAgeSeconds)
+                .httpOnly(jwtCookieHttpOnly)
+                .secure(jwtCookieSecure)
+                .sameSite(jwtCookieSameSite)
                 .build();
         return cookie;
     }
 
     public ResponseCookie getCleanCookie() { //Used in sign in
         ResponseCookie cookie = ResponseCookie.from(jwtCookie, null)
-                .path("/api")  //Valid within this
+                .path(jwtCookiePath)
+                .maxAge(0)
+                .httpOnly(jwtCookieHttpOnly)
+                .secure(jwtCookieSecure)
+                .sameSite(jwtCookieSameSite)
                 .build();
         return cookie;
     }

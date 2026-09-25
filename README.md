@@ -59,8 +59,11 @@ FinLedger addresses the core problems of any money-movement system:
 - Redis-backed distributed rate limiting (Bucket4j token buckets)
 - Redis balance caching with owner-ID verification and graceful fallback
 - JWT-based stateless authentication (cookie and `Authorization` header)
+- Hardened session cookie (`HttpOnly`, `SameSite=Lax`, configurable `Secure`, lifetime aligned to the JWT) with **CSRF protection** for cookie clients
 - Role-based access control (`ROLE_USER` / `ROLE_ADMIN`) and per-request ownership checks
 - Bean Validation on all request payloads with a global exception handler
+- **Flyway versioned schema migrations** (`db/migration`) with Hibernate `ddl-auto=validate`
+- Consistent structured error responses across 400 / 401 / 403 / 404 / 405 / 409 / 500
 - Paginated, sortable account statements
 - Multi-instance Docker deployment behind an Nginx load balancer
 - GitHub Actions CI (unit tests → build) and Swagger/OpenAPI docs
@@ -160,13 +163,15 @@ This provides a **tamper-evident, cryptographically linked audit trail**: silent
 
 | Layer | Implementation |
 |---|---|
-| **Authentication** | JWT signed via JJWT (HMAC-SHA; the algorithm is derived from the signing-secret length — the bundled dev secret yields HS512). Tokens are accepted from a cookie *or* the `Authorization: Bearer` header (the header variant exists for Swagger/Postman). |
-| **Cookie settings** | Cookie name is `spring.app.jwtCookieName` (dev default `FinLedger`), path `/api`, max-age 24h. Note: the cookie is explicitly **not** `HttpOnly` in the current implementation — the JWT is also returned in the sign-in response body. Hardening options are listed under [Future Improvements](#potential-future-improvements). |
-| **Statelessness** | `SessionCreationPolicy.STATELESS`; no server-side session store, no CSRF session token. CSRF protection is disabled (documented trade-off for the cookie mode). |
+| **Authentication** | JWT signed via JJWT **HS512** (`spring.app.jwtSecret`, base64, enforced ≥ 64 decoded bytes / 512 bits — the app refuses to start otherwise). Tokens are accepted from a cookie *or* the `Authorization: Bearer` header (the header variant exists for Swagger/Postman). |
+| **Cookie settings** | Cookie name `spring.app.jwtCookieName` (default `FinLedger`), path `/api`, `HttpOnly`, `SameSite=Lax`, optional `Secure` (set `JWT_COOKIE_SECURE=true` behind HTTPS; off by default for plain-HTTP local dev). `maxAge` is **aligned to the JWT lifetime** (`jwtExpirationMs / 1000`) so the browser never holds an expired token. The JWT is also returned in the sign-in response body (frontend contract preserved). |
+| **CSRF** | Enabled for cookie-authenticated clients: Spring's eager-loading handler writes an `XSRF-TOKEN` cookie on the first response; the client echoes it as the `X-XSRF-TOKEN` header on state-changing requests. CSRF is skipped when an `Authorization` header is present (Bearer clients are immune) and for the `/api/auth/**` endpoints that must stay frictionless. `SameSite=Lax` and the CORS allowlist provide defense in depth. |
+| **Statelessness** | `SessionCreationPolicy.STATELESS`; no server-side session store, no `JSESSIONID`. |
 | **Passwords** | BCrypt (`BCryptPasswordEncoder`, default strength 10). |
 | **Authorization** | Method-level `@PreAuthorize` (e.g. `ROLE_ADMIN` on the audit endpoint) plus service-layer ownership checks: a user may only act on accounts they own, and only `CENTRAL_BANK` bypasses ownership. Unauthenticated requests are rejected with a structured 401 via `AuthEntryPointJwt`; authenticated requests lacking the required role are rejected with a structured 403 via `AuthAccessDeniedHandler`. |
-| **CORS** | Allows `http://localhost:5173` with credentials. |
-| **Error responses** | A global `@RestControllerAdvice` maps validation, not-found, duplicate, insufficient-funds, and invalid-operation conditions to consistent JSON. Unauthenticated requests get a structured 401 via `AuthEntryPointJwt`. |
+| **CORS** | Comma-separated allowlist from `spring.app.allowedOrigins` (default `http://localhost:5173`) with credentials — required because requests carry cookies. |
+| **Error responses** | Framework-level errors (400 malformed body, 404 unknown path, 405 wrong method, 409 constraint conflict, 500) share one JSON shape `{status, error, message, path}` consistent with the 401/403 handlers; business errors keep the `ApiResponse {message, success}` shape (or `{field: message}` for bean-validation 400s). Unknown paths now return **404 JSON for authenticated users** and **401 for unauthenticated ones** (previously both fell through to the `/error` handling). |
+| **Schema management** | Flyway owns the schema (`db/migration/V1__baseline.sql`); Hibernate runs in `validate` mode. Existing databases are adopted with `baseline-on-migrate` (see [Database](#database)). |
 | **Rate limiting** | Per-user distributed limits (see [Redis](#redis)). |
 
 ### Seeded default admin
@@ -217,11 +222,16 @@ PostgreSQL 15, accessed through Spring Data JPA/Hibernate. UUID primary keys; am
 | — | `user_role` | Many-to-many join |
 | `Account` | `accounts` | `@Version` for optimistic locking; `balance`; `currency`; owner FK to `users` |
 | `Transaction` | `transaction` | **unique** `reference_id` (idempotency key); `type`, `status`, `timestamp` |
-| `LedgerEntry` | `ledgerEntries` | `amount`, `hash`, `previous_hash`, FKs to account + transaction |
+| `LedgerEntry` | `ledger_entries` | `amount`, `hash`, `previous_hash`, FKs to account + transaction |
 
 Relationships: one user → many accounts; one transaction → two ledger entries (one per account); one account → many ledger entries (its full history).
 
-**Migration strategy:** the schema is generated by Hibernate (`ddl-auto=update`). There is **no Flyway/Liquibase migration tool** in this project.
+**Migration strategy:** schema DDL lives in versioned Flyway migrations under `src/main/resources/db/migration` (`V1__baseline.sql` reproduces the schema exactly as the entities define it, including the physical naming `ledger_entries`, the quoted `timestamp` column, and the Hibernate enum CHECK constraints). Hibernate runs with `spring.jpa.hibernate.ddl-auto=validate` so any drift between the entity mapping and the migrated schema fails startup.
+
+Two upgrade paths are supported:
+
+- **Fresh database** — Flyway executes `V1__baseline.sql`, then `DataSeeder` seeds roles, the admin, and `CENTRAL_BANK`.
+- **Existing database** (created before Flyway) — `spring.flyway.baseline-on-migrate=true` records a baseline at version 1 (`V1` is *not* re-executed because the objects already exist) and future migrations `V2`, `V3`, … apply on top. Verified live: existing accounts, balances, transactions, and ledger hash chains survive intact.
 
 ---
 
@@ -308,9 +318,11 @@ src/
 │   │   └── tools/                      # HackerAttack (dev concurrency load tool)
 │   └── resources/
 │       ├── application.properties.example
+│       ├── db/migration/              # Flyway versioned migrations (V1__baseline.sql)
 │       └── logback.xml
 ├── test/
 │   └── java/com/example/finledger/     # Unit tests (service + security)
+├── .env.example                        # Required env vars (JWT_SECRET, cookie/CORS overrides)
 ├── Dockerfile                           # Multi-stage build
 ├── docker-compose.yml                   # 6-service stack + Nginx LB
 ├── nginx.conf                           # Round-robin upstream config
@@ -360,17 +372,25 @@ cp src/main/resources/application.properties.example src/main/resources/applicat
 
 | Variable | Purpose | Example / Default |
 |---|---|---|
+| `JWT_SECRET` (compose, **required**) | Base64-encoded HS512 signing key, **≥ 64 decoded bytes (512 bits)**; the app fails startup if missing, short, or invalid base64 | generate: `openssl rand -base64 64` |
 | `spring.datasource.url` / `SPRING_DATASOURCE_URL` | PostgreSQL JDBC URL | `jdbc:postgresql://localhost:5432/finledger_db` |
 | `spring.datasource.username` | DB user | `postgres` |
 | `spring.datasource.password` | DB password | `<your-password>` |
 | `spring.data.redis.host` / `SPRING_DATA_REDIS_HOST` | Redis host | `localhost` |
 | `spring.data.redis.port` | Redis port | `6379` |
-| `spring.app.jwtSecret` / `SPRING_APP_JWTSECRET` | Base64-encoded HMAC secret for JWT signing | `<your-secret>` |
-| `spring.app.jwtExpirationMs` | JWT lifetime | `3600000` |
+| `spring.app.jwtSecret` / `SPRING_APP_JWTSECRET` | Base64-encoded HMAC secret for JWT signing | load from `JWT_SECRET` |
+| `spring.app.jwtExpirationMs` | JWT lifetime (cookie `maxAge` follows automatically) | `3600000` |
 | `spring.app.jwtCookieName` | Cookie name carrying the JWT | `FinLedger` |
-| `spring.jpa.hibernate.ddl-auto` | Schema generation | `update` |
+| `spring.app.jwtCookiePath` | Cookie path | `/api` |
+| `spring.app.jwtCookieHttpOnly` | `HttpOnly` flag on the JWT cookie | `true` |
+| `spring.app.jwtCookieSecure` | `Secure` flag (set `JWT_COOKIE_SECURE=true` behind HTTPS) | `false` |
+| `spring.app.jwtCookieSameSite` | `SameSite` attribute | `Lax` |
+| `spring.app.allowedOrigins` | Comma-separated CORS allowlist | `http://localhost:5173` |
+| `spring.flyway.enabled` | Flyway migration on startup | `true` |
+| `spring.flyway.baseline-on-migrate` | Adopt a pre-Flyway schema as baseline V1 | `true` |
+| `spring.jpa.hibernate.ddl-auto` | Hibernate schema mode (**do not switch back to `update`**) | `validate` |
 
-> **Never commit a real secret.** The values in `docker-compose.yml` are throwaway developer defaults for the local stack only.
+> **Never commit a real secret.** Compose reads `JWT_SECRET` from a local `.env` file (see `.env.example`); copy it and generate a fresh key. `docker compose` refuses to start without `JWT_SECRET` being set.
 
 ---
 
@@ -381,6 +401,7 @@ cp src/main/resources/application.properties.example src/main/resources/applicat
 ```bash
 git clone <repository-url>
 cd finledger
+cp .env.example .env          # then set JWT_SECRET (openssl rand -base64 64)
 docker compose up --build
 ```
 
@@ -390,7 +411,7 @@ docker compose up --build
 | `http://localhost/swagger-ui.html` | Interactive API docs |
 | `http://localhost:5050` | pgAdmin (`admin@admin.com` / `admin`) |
 
-The two app instances are **not** published on host ports — traffic enters exclusively through Nginx on port 80. PostgreSQL (`5432`) and Redis (`6379`) are exposed for tooling.
+The two app instances are **not** published on host ports — traffic enters exclusively through Nginx on port 80. PostgreSQL (`5432`) and Redis (`6379`) are exposed for tooling. The existing dev database volume is adopted automatically (Flyway baselines it at V1); a fresh database gets `V1__baseline.sql` applied from scratch.
 
 ### Option 2 — Local development
 
@@ -471,19 +492,24 @@ These make the system **horizontally scalable behind the load balancer** and con
 
 ## Testing Strategy
 
-29 JUnit 5 + Mockito tests across five test classes. The service tests mock all dependencies (`@ExtendWith(MockitoExtension.class)`), so tests run without external services and are CI-friendly. The `AdminControllerAuthorizationTest` web-layer tests cover the admin-endpoint authorization matrix (unauthenticated → 401, `ROLE_USER` → 403, `ROLE_ADMIN` → 200).
+**51 JUnit 5 + Mockito tests across ten test classes.** The service tests mock all dependencies (`@ExtendWith(MockitoExtension.class)`), so tests run without external services and are CI-friendly. The security web-layer tests (`@WebMvcTest` slices) exercise the real security filter chain and cover the auth/CSRF/error matrix.
 
 | Test class | Tests | Coverage |
 |---|---|---|
 | `AccountServiceImplTest` | 21 | Transfer (zero/negative amount, duplicate `referenceId`, missing accounts, unauthorized sender, insufficient funds, `CENTRAL_BANK` bypass, success + cache invalidation), Deposit (missing account, unauthorized, missing vault, delegates to transfer), Balance (cache hit owner-match, cache hit owner-mismatch, cache miss + populate, Redis read/write failure → DB fallback), Statement (missing account, unauthorized, CREDIT/DEBIT derivation) |
 | `AdminServiceImplTest` | 3 | Audit: valid chain, broken link, tampered data |
+| `JwtSecretValidationTest` | 7 | Fail-fast startup validation: missing / sub-64-byte (32, 48, 63 decoded bytes) / invalid-base64 secret and non-positive expiration throw; a 64-byte secret passes and generates real **HS512** tokens |
+| `JwtUtilsCookieTest` | 4 | Cookie hardening: `HttpOnly`, `SameSite=Lax`, `secure` on/off, `Path=/api`, `Max-Age` aligned to `jwtExpirationMs`; sign-out cookie `Max-Age=0` |
+| `AuthControllerSignInCookieTest` | 2 | Sign-in `Set-Cookie` attributes + JWT kept in response body; sign-out clears the cookie |
+| `CsrfProtectionTest` | 4 | POST without token → 403; POST with CSRF token → success; POST with `Authorization` header (Bearer) bypasses CSRF; safe GET passes without a token |
+| `ErrorResponseTest` | 5 | Framework errors in the `{status,error,message,path}` shape: authenticated 404, unauthenticated 401, malformed-body 400, wrong-method 405, unexpected 500 without leaking internals |
 | `AuthEntryPointJwtTest` | 1 | 401 response shape |
 | `AuthAccessDeniedHandlerTest` | 1 | 403 response shape |
 | `AdminControllerAuthorizationTest` | 3 | Admin endpoint: unauthenticated → 401, `ROLE_USER` → 403, `ROLE_ADMIN` → 200 |
 
-Techniques: `@Spy @InjectMocks` (verifies `deposit` delegates to `transfer`), `ArgumentCaptor` (asserts exact saved entity values), `doThrow` (`RedisConnectionFailureException` for graceful-degradation paths).
+Techniques: `@Spy @InjectMocks` (verifies `deposit` delegates to `transfer`), `ArgumentCaptor` (asserts exact saved entity values), `doThrow` (`RedisConnectionFailureException` for graceful-degradation paths), `spring-security-test` `@WithMockUser` and `csrf()` against the real `WebSecurityConfig`.
 
-There are currently **no integration tests or Testcontainers setups** — this is a deliberate future improvement rather than an implementation detail of production code.
+There are currently **no integration tests or Testcontainers setups** — migration, schema-validation, and the full HTTP behavior were instead verified live against real PostgreSQL/Redis containers during hardening.
 
 ---
 
@@ -508,16 +534,14 @@ Two separate, cross-instance problems: (1) caching hot balance reads with a shor
 It turns the ledger into a **tamper-evident audit log**: any modification to an entry breaks its hash, which cascades to the next entry's `prevHash`. The audit endpoint pinpoints the exact corrupted entry. It is an integrity mechanism, not a consensus system.
 
 ### Why JWT cookies *and* Bearer header?
-Cookies give browsers automatic, credential-safe transport; the header variant keeps Swagger/Postman usable and supports non-browser clients. Both parse paths are enforced by the same `AuthTokenFilter`.
+Cookies give browsers automatic, credential-safe transport; the header variant keeps Swagger/Postman usable and supports non-browser clients. Both parse paths are enforced by the same `AuthTokenFilter`. Because cookie mode enables cross-site request forgery, CSRF is enforced for cookie clients (via the `XSRF-TOKEN` cookie / `X-XSRF-TOKEN` header, backed by the `SameSite=Lax` JWT cookie) while Bearer-header requests bypass the CSRF check — they cannot be subject to browser-authenticated CSRF.
 
 ---
 
 ## Potential Future Improvements
 
-- Integration and end-to-end tests with Testcontainers (PostgreSQL + Redis), including concurrent-transfer scenarios.
-- Replace Hibernate `ddl-auto=update` with versioned migrations (Flyway/Liquibase).
-- Harden the JWT cookie: add `HttpOnly`, `Secure`, and `SameSite` and re-evaluate CSRF posture.
-- External secret management (env-sealed secrets, Vault/KMS) instead of config-file/compose defaults.
+- Integration and end-to-end tests with Testcontainers (PostgreSQL + Redis), including concurrent-transfer scenarios and a Flyway `V2` schema-change migration.
+- External secret management (env-sealed secrets, Vault/KMS) instead of an env-supplied secret.
 - Observability: Actuator endpoints, Micrometer metrics, structured logging, distributed tracing.
 - Derive/enforce ledger ordering with an explicit indexed ordering column to make the hash chain iteration fully deterministic.
 - Introduce actual Spring Batch jobs (dependency is present but unused) or remove the unused starter/model-mapper dependencies.

@@ -13,7 +13,7 @@ RUN chmod +x mvnw && ./mvnw dependency:go-offline -B
 
 COPY src/ src/
 
-# Build the JAR (skip tests — they need DB/Redis running)
+# Build the JAR (tests are skipped here — they are pure unit tests and run in CI)
 RUN ./mvnw clean package -DskipTests -B
 
 

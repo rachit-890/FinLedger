@@ -2,13 +2,41 @@ spring.datasource.url=jdbc:postgresql://localhost:5432/finledger_db
 spring.datasource.username=your_username
 spring.datasource.password=your_password
 
-spring.jpa.hibernate.ddl-auto=update
+# --- Database schema management (Flyway) ---
+# Flyway owns the schema DDL (db/migration). Hibernate only VALIDATES that its
+# entity mapping still matches the Flyway-applied schema.
+spring.flyway.enabled=true
+spring.flyway.baseline-on-migrate=true
+spring.flyway.baseline-version=1
+spring.jpa.hibernate.ddl-auto=validate
 spring.jpa.show-sql=true
 spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect
 
-spring.app.jwtSecret=your_jwt_secret_here
+# --- JWT ---
+# MUST be a base64-encoded key of at least 64 bytes (512 bits) for HS512. Generate with:
+#   openssl rand -base64 64
+# The application refuses to start if the secret is missing or decodes to fewer than 64 bytes.
+spring.app.jwtSecret=your_base64_jwt_secret_here
+# Token lifetime in milliseconds. The auth cookie lifetime is aligned to this
+# value automatically (maxAge = jwtExpirationMs / 1000), so they never diverge.
 spring.app.jwtExpirationMs=3600000
-spring.app.jwtCookieName=your_cookie_name
+
+# --- Auth cookie ---
+# Name of the cookie that carries the JWT in cookie mode.
+spring.app.jwtCookieName=FinLedger
+# Cookie attributes. HttpOnly is ON by default (the JWT is read only from the
+# Authorization header by JS-based clients; the cookie is managed by the browser).
+spring.app.jwtCookiePath=/api
+spring.app.jwtCookieHttpOnly=true
+# Secure must be true wherever the app is served over HTTPS (set via
+# JWT_COOKIE_SECURE in Docker). Keep false only for plain-HTTP local dev.
+spring.app.jwtCookieSecure=false
+spring.app.jwtCookieSameSite=Lax
+
+# --- CORS ---
+# Comma-separated list of allowed origins. An explicit allowlist is required
+# because requests carry credentials (cookies). Default: http://localhost:5173
+spring.app.allowedOrigins=http://localhost:5173
 
 spring.application.name=FinLedger
 

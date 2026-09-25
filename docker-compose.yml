@@ -36,12 +36,28 @@ services:
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
       SERVER_PORT: 8080
-      # Schema is managed by Hibernate (matches application.properties.example). No Flyway.
-      SPRING_JPA_HIBERNATE_DDL_AUTO: update
-      # JWT — developer defaults for the local stack. Override in production.
-      SPRING_APP_JWTSECRET: Omuw5HWMivL2oR8nDDPoCfy66ENRUGzeKlqPJZ+cUxlFNL99r69GfESL1IkQdy+rvaH1cPB+HETr/VMTjuiSMQ==
-      SPRING_APP_JWTEXPIRATIONMS: 3600000
-      SPRING_APP_JWTCOOKIENAME: FinLedger
+      # --- Database schema management (Flyway) ---
+      # Flyway applies db/migration; Hibernate only validates that its entity
+      # mapping still matches. For an existing dev database, baseline-on-migrate
+      # marks the pre-Flyway schema as V1 and future migrations apply on top.
+      SPRING_JPA_HIBERNATE_DDL_AUTO: validate
+      SPRING_FLYWAY_ENABLED: "true"
+      SPRING_FLYWAY_BASELINE_ON_MIGRATE: "true"
+      SPRING_FLYWAY_BASELINE_VERSION: "1"
+      # --- JWT (REQUIRED) ---
+      # Copy .env.example to .env and set JWT_SECRET (base64, >= 64 bytes / 512 bits for HS512):
+      #   openssl rand -base64 64
+      SPRING_APP_JWTSECRET: ${JWT_SECRET:?JWT_SECRET is required. Copy .env.example to .env and set it.}
+      SPRING_APP_JWTEXPIRATIONMS: ${JWT_EXPIRATION_MS:-3600000}
+      SPRING_APP_JWTCOOKIENAME: ${JWT_COOKIE_NAME:-FinLedger}
+      # --- Cookie hardening (env-overridable) ---
+      SPRING_APP_JWTCOOKIEPATH: /api
+      SPRING_APP_JWTCOOKIEHTTPONLY: ${JWT_COOKIE_HTTPONLY:-true}
+      # Secure must be true when served over HTTPS (set JWT_COOKIE_SECURE=true).
+      SPRING_APP_JWTCOOKIESECURE: ${JWT_COOKIE_SECURE:-false}
+      SPRING_APP_JWTCOOKIESAMESITE: ${JWT_COOKIE_SAMESITE:-Lax}
+      # --- CORS (comma-separated allowlist; frontend origin) ---
+      SPRING_APP_ALLOWEDORIGINS: ${FRONTEND_ORIGIN:-http://localhost:5173}
     networks:
       - finledger-net
 
